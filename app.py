@@ -2,7 +2,6 @@ import streamlit as st
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_ollama import OllamaLLM
-
 from sentence_transformers import CrossEncoder
 
 # ---------------- UI ----------------
@@ -17,11 +16,27 @@ model_choice = st.sidebar.selectbox(
     ["qwen2.5:7b", "llama3.2:1b"]
 )
 
-k_value = st.sidebar.slider("Chunks to retrieve (k)", 1, 10, 5)
-
 if st.sidebar.button("🧹 Clear Chat"):
     st.session_state.chat_history = []
     st.session_state.history = []
+
+# ---------------- Dynamic K ----------------
+def get_k_values(query, model_name):
+    q_len = len(query)
+
+    if q_len < 30:
+        retrieve_k = 6
+    elif q_len < 100:
+        retrieve_k = 8
+    else:
+        retrieve_k = 10
+
+    if "1b" in model_name:
+        final_k = 2
+    else:
+        final_k = 3
+
+    return retrieve_k, final_k
 
 # ---------------- Load DB ----------------
 @st.cache_resource
@@ -30,19 +45,16 @@ def load_db():
         model_name="sentence-transformers/all-MiniLM-L6-v2"
     )
 
-    db = Chroma(
+    return Chroma(
         persist_directory="./chroma_db",
         embedding_function=embeddings
     )
-    return db
 
 try:
     db = load_db()
 except:
     st.error("⚠️ Vector DB not found. Run ingest.py first.")
     st.stop()
-
-retriever = db.as_retriever(search_kwargs={"k": k_value})
 
 # ---------------- Reranker ----------------
 @st.cache_resource
@@ -68,37 +80,41 @@ if "history" not in st.session_state:
 # ---------------- Chat Input ----------------
 query = st.chat_input("Ask something about your documents...")
 
+# 🚨 FIX: Only calculate k AFTER query exists
 if query:
 
-    # ✅ 1. Create improved search query (IMPORTANT)
+    retrieve_k, final_k = get_k_values(query, model_choice)
+
+    retriever = db.as_retriever(search_kwargs={"k": retrieve_k})
+
+    # Step 1: Better search query
     search_query = f"{query} detailed explanation with context"
 
-    # ✅ 2. Show what is actually used for retrieval
     st.markdown(f"### 🔍 Search Query Used:\n`{search_query}`")
 
-    # Step 1: Retrieve (use improved query)
+    # Step 2: Retrieve
     docs = retriever.invoke(search_query)
 
-    # Step 2: Rerank (use ORIGINAL query for accuracy)
+    # Step 3: Rerank
     pairs = [[query, d.page_content] for d in docs]
     scores = reranker.predict(pairs)
 
     ranked = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
-    docs = [d for _, d in ranked[:3]]
+    docs = [d for _, d in ranked[:final_k]]
 
-    # Step 3: Build Context
+    # Step 4: Context
     context = "\n\n".join([
         f"[Source {i+1} | File: {d.metadata.get('source_file','')} | Page/Row: {d.metadata.get('page', d.metadata.get('row','N/A'))}]\n{d.page_content}"
         for i, d in enumerate(docs)
     ])
 
-    # Step 4: Memory Context
+    # Step 5: Memory
     history_text = "\n".join([
         f"User: {u}\nAI: {a}"
         for u, a in st.session_state.history[-3:]
     ])
 
-    # Step 5: Prompt
+    # Step 6: Prompt
     prompt = f"""
 You are an expert assistant.
 
@@ -123,22 +139,21 @@ Question:
 Answer:
 """
 
-    # Step 6: LLM Response
+    # Step 7: LLM
     response = llm.invoke(prompt)
 
-    # Step 7: Save Memory
+    # Step 8: Save
     st.session_state.chat_history.append(("user", query))
     st.session_state.chat_history.append(("ai", response))
     st.session_state.history.append((query, response))
 
-    # ---------------- Sources ----------------
+    # ---------------- Sources UI ----------------
     with st.expander("📄 Sources Used"):
         for i, doc in enumerate(docs):
             st.markdown(
                 f"**Source {i+1} | File: {doc.metadata.get('source_file','')} | Page/Row: {doc.metadata.get('page', doc.metadata.get('row','N/A'))}**"
             )
 
-            # Highlight query
             text = doc.page_content
             if query.lower() in text.lower():
                 text = text.replace(query, f"**{query}**")
